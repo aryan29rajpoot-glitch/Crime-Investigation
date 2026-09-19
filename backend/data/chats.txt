@@ -1,0 +1,8 @@
+2026-09-10 10:15 +919876543210:
+Send 50000 to scammer@upi.
+
+2026-09-10 10:40 +919812345678:
+Money received.
+
+2026-09-10 11:05 +919812345678:
+Transfer remaining amount to mule@upi.
