@@ -1,0 +1,5 @@
+timestamp,account,upi,amount,type
+2026-09-10 10:30,AC1001,scammer@upi,50000,DEBIT
+2026-09-10 10:35,AC2001,scammer@upi,50000,CREDIT
+2026-09-10 11:10,AC2001,mule@upi,45000,TRANSFER
+2026-09-10 11:15,AC3001,mule@upi,45000,CREDIT

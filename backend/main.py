@@ -1,897 +1,416 @@
-from fastapi import FastAPI
+import os
+import re
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from parsers.cdr_parser import parse_cdr
 from parsers.bank_parser import parse_bank
 from parsers.chat_parser import parse_chat
-
 from extraction.entities import extract_entities
+from correlation.graph import build_graph
 from analysis.risk_score import calculate_risk
-
-import os
-import re
-
+import case_manager
 
 # ============================================================
-# APP
+# APP CONFIG
 # ============================================================
 
 app = FastAPI(
     title="FraudLens API",
-    description="Digital Investigation & Artifact Correlation",
-    version="1.0.0"
+    description="Digital Forensics & Cross-Channel Artifact Correlation Platform",
+    version="2.0.0"
 )
-
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "http://127.0.0.1:3000"
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "*"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
-
-# ============================================================
-# PATHS
-# ============================================================
-
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-DATA_DIR = os.path.join(
-    BASE_DIR,
-    "data"
-)
-
-CDR_PATH = os.path.join(
-    DATA_DIR,
-    "cdr.csv"
-)
-
-BANK_PATH = os.path.join(
-    DATA_DIR,
-    "bank.csv"
-)
-
-CHAT_PATH = os.path.join(
-    DATA_DIR,
-    "chats.txt"
-)
+# Initialize default case storage on boot
+case_manager.ensure_cases_dir()
 
 
 # ============================================================
-# HOME
+# UTILITIES
+# ============================================================
+
+def parse_iso_or_custom_timestamp(ts_str):
+    if not ts_str:
+        return None
+    s = str(ts_str).strip()
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%y, %H:%M",
+        "%d/%m/%Y, %H:%M"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def detect_rapid_transfer(bank_records, threshold_minutes=60):
+    """
+    Detects high-velocity pass-through transfers (layering) where funds
+    enter an account via CREDIT and leave via DEBIT/TRANSFER within threshold_minutes.
+    """
+    if not bank_records or len(bank_records) < 2:
+        return {
+            "detected": False,
+            "fastest_delta_minutes": None,
+            "flagged_accounts": []
+        }
+
+    # Group incoming credits and outgoing debits by bank account
+    account_credits = {}
+    account_debits = {}
+
+    for record in bank_records:
+        ts = parse_iso_or_custom_timestamp(record.get("timestamp"))
+        if not ts:
+            continue
+
+        acc = record.get("account")
+        rel = record.get("relationship", "").upper()
+
+        if not acc:
+            continue
+
+        if rel in ["CREDIT", "CR", "IN"]:
+            account_credits.setdefault(acc, []).append((ts, record))
+        elif rel in ["DEBIT", "DR", "OUT", "TRANSFER"]:
+            account_debits.setdefault(acc, []).append((ts, record))
+
+    flagged_accounts = set()
+    fastest_delta = None
+
+    for acc, credits in account_credits.items():
+        debits = account_debits.get(acc, [])
+        for c_time, c_rec in credits:
+            for d_time, d_rec in debits:
+                if d_time >= c_time:
+                    delta_mins = (d_time - c_time).total_seconds() / 60.0
+                    if delta_mins <= threshold_minutes:
+                        flagged_accounts.add(acc)
+                        if fastest_delta is None or delta_mins < fastest_delta:
+                            fastest_delta = delta_mins
+
+    # Also detect multiple fast transactions anywhere in sequence
+    all_timestamps = []
+    for r in bank_records:
+        parsed_t = parse_iso_or_custom_timestamp(r.get("timestamp"))
+        if parsed_t:
+            all_timestamps.append(parsed_t)
+    all_timestamps.sort()
+
+    for i in range(len(all_timestamps) - 1):
+        diff = (all_timestamps[i + 1] - all_timestamps[i]).total_seconds() / 60.0
+        if diff <= threshold_minutes:
+            if fastest_delta is None or diff < fastest_delta:
+                fastest_delta = diff
+
+    detected = len(flagged_accounts) > 0 or (fastest_delta is not None and fastest_delta <= threshold_minutes)
+
+    return {
+        "detected": detected,
+        "fastest_delta_minutes": round(fastest_delta, 1) if fastest_delta is not None else None,
+        "flagged_accounts": list(flagged_accounts)
+    }
+
+
+def generate_timeline(cdr_records, bank_records, chat_messages):
+    """
+    Builds a unified chronological timeline across telecom calls,
+    financial transfers, and chat messages.
+    """
+    events = []
+
+    for c in cdr_records:
+        ts = c.get("timestamp")
+        events.append({
+            "timestamp": ts,
+            "type": "CALL",
+            "channel": "telecom",
+            "source": c.get("caller"),
+            "target": c.get("receiver"),
+            "description": f"Voice call from {c.get('caller')} to {c.get('receiver')} ({c.get('duration', 0)}s)"
+        })
+
+    for b in bank_records:
+        ts = b.get("timestamp")
+        amt_str = f"₹{b.get('amount'):,}" if b.get("amount") else "amount unspecified"
+        events.append({
+            "timestamp": ts,
+            "type": b.get("relationship", "TRANSFER"),
+            "channel": "banking",
+            "source": b.get("source"),
+            "target": b.get("target"),
+            "amount": b.get("amount"),
+            "description": f"{b.get('relationship')} transfer of {amt_str} from {b.get('source')} to {b.get('target')}"
+        })
+
+    for m in chat_messages:
+        ts = m.get("timestamp")
+        events.append({
+            "timestamp": ts,
+            "type": "CHAT",
+            "channel": "chat",
+            "source": m.get("sender"),
+            "target": m.get("upis")[0] if m.get("upis") else None,
+            "description": f"Message from {m.get('sender')}: \"{m.get('body')[:80]}\""
+        })
+
+    # Sort events by timestamp where available
+    def sort_key(ev):
+        parsed = parse_iso_or_custom_timestamp(ev["timestamp"])
+        return parsed or datetime.max
+
+    events.sort(key=sort_key)
+    return events
+
+
+# ============================================================
+# CORE CASE ANALYSIS ENGINE
+# ============================================================
+
+def analyze_case_data(case_info):
+    cdr_records = []
+    bank_records = []
+    chat_data = {"phones": [], "upi_ids": [], "bank_accounts": [], "chat_links": [], "messages": [], "raw_text": ""}
+
+    # 1. Parse CDR
+    if case_info.get("cdr_path") and os.path.exists(case_info["cdr_path"]):
+        try:
+            cdr_records = parse_cdr(case_info["cdr_path"])
+        except Exception as err:
+            print("CDR Parse Error:", err)
+
+    # 2. Parse Bank
+    if case_info.get("bank_path") and os.path.exists(case_info["bank_path"]):
+        try:
+            bank_records = parse_bank(case_info["bank_path"])
+        except Exception as err:
+            print("Bank Parse Error:", err)
+
+    # 3. Parse Chat
+    if case_info.get("chat_path") and os.path.exists(case_info["chat_path"]):
+        try:
+            chat_data = parse_chat(case_info["chat_path"])
+        except Exception as err:
+            print("Chat Parse Error:", err)
+
+    # 4. Extract Entities
+    combined_raw_text = (
+        str(cdr_records) + "\n" +
+        str(bank_records) + "\n" +
+        chat_data.get("raw_text", "")
+    )
+    entities = extract_entities(combined_raw_text)
+
+    # Merge explicitly discovered entities from parsers
+    for c in cdr_records:
+        if c.get("caller") and c["caller"] not in entities["phones"]:
+            entities["phones"].append(c["caller"])
+        if c.get("receiver") and c["receiver"] not in entities["phones"]:
+            entities["phones"].append(c["receiver"])
+
+    for b in bank_records:
+        src = b.get("source")
+        tgt = b.get("target")
+        for val in [src, tgt]:
+            if not val:
+                continue
+            if "@" in val and val not in entities["upi_ids"]:
+                entities["upi_ids"].append(val)
+            elif not "@" in val and not val.startswith("+") and val not in entities["bank_accounts"]:
+                entities["bank_accounts"].append(val)
+
+    for u in chat_data.get("upi_ids", []):
+        if u not in entities["upi_ids"]:
+            entities["upi_ids"].append(u)
+
+    entities["phones"].sort()
+    entities["upi_ids"].sort()
+    entities["bank_accounts"].sort()
+
+    # 5. Build NetworkX Graph
+    graph_res = build_graph(cdr_records, bank_records, chat_data)
+    node_data = graph_res["nodes"]
+    edge_data = graph_res["edges"]
+    metrics = graph_res["metrics"]
+
+    # 6. Temporal Velocity Detection
+    rapid_info = detect_rapid_transfer(bank_records, threshold_minutes=60)
+
+    # 7. Cross-Channel Nexus Detection
+    # Check if a phone in CDR also appears as a sender or entity in Chat
+    cdr_phones = set()
+    for c in cdr_records:
+        if c.get("caller"): cdr_phones.add(c["caller"])
+        if c.get("receiver"): cdr_phones.add(c["receiver"])
+
+    chat_phones = set(chat_data.get("phones", []))
+    nexus_phones = cdr_phones.intersection(chat_phones)
+    cross_channel_nexus = len(nexus_phones) > 0
+
+    # 8. Calibrated Risk Analysis
+    risk_analysis = calculate_risk(
+        transaction_count=len(bank_records),
+        connected_entities=len(node_data),
+        rapid_transfer=rapid_info["detected"],
+        cross_channel_nexus=cross_channel_nexus,
+        mule_count=len(metrics["mule_nodes"]),
+        nodes=node_data,
+        edges=edge_data
+    )
+
+    # Attach per-node risk to node_data for frontend rendering
+    for node in node_data:
+        n_id = node["id"]
+        if n_id in risk_analysis["entity_risks"]:
+            node["risk"] = risk_analysis["entity_risks"][n_id]
+
+    # 9. Chronological Timeline
+    timeline = generate_timeline(cdr_records, bank_records, chat_data.get("messages", []))
+
+    return {
+        "case_id": case_info["case_id"],
+        "metadata": {
+            "title": case_info.get("title", case_info["case_id"]),
+            "description": case_info.get("description", ""),
+            "created_at": case_info.get("created_at", ""),
+            "is_default": case_info.get("is_default", False)
+        },
+        "evidence": {
+            "cdr_records": len(cdr_records),
+            "bank_records": len(bank_records),
+            "chat_evidence": bool(chat_data.get("raw_text", "").strip()),
+            "chat_messages": len(chat_data.get("messages", [])),
+            "rapid_transfer_flag": rapid_info["detected"],
+            "cross_channel_nexus": cross_channel_nexus
+        },
+        "entities": entities,
+        "graph": {
+            "nodes": len(node_data),
+            "relationships": len(edge_data),
+            "node_data": node_data,
+            "edge_data": edge_data,
+            "metrics": metrics
+        },
+        "risk_analysis": risk_analysis,
+        "timeline": timeline
+    }
+
+
+# ============================================================
+# ENDPOINTS
 # ============================================================
 
 @app.get("/")
 def home():
-
     return {
-        "message": "FraudLens API is running"
+        "message": "FraudLens Digital Forensics API v2.0 is running",
+        "active_cases": len(case_manager.list_cases())
     }
 
 
-# ============================================================
-# PHONE NORMALIZATION
-# ============================================================
-
-def normalize_phone(phone):
-
-    if phone is None:
-        return None
-
-    phone = str(phone).strip()
-
-    if phone.endswith(".0"):
-        phone = phone[:-2]
-
-    phone = re.sub(
-        r"[^\d+]",
-        "",
-        phone
-    )
-
-    if not phone:
-        return None
-
-    if phone.startswith("91") and len(phone) == 12:
-        return "+" + phone
-
-    if len(phone) == 10:
-        return "+91" + phone
-
-    return phone
-
-
-# ============================================================
-# CDR NORMALIZATION
-# ============================================================
-
-def normalize_cdr(records):
-
-    result = []
-
-    for record in records:
-
-        caller = normalize_phone(
-            record.get("caller")
-        )
-
-        receiver = normalize_phone(
-            record.get("receiver")
-        )
-
-        timestamp = record.get(
-            "timestamp"
-        )
-
-        duration = record.get(
-            "duration"
-        )
-
-        if caller and receiver:
-
-            result.append(
-                {
-                    "timestamp": str(timestamp),
-                    "caller": caller,
-                    "receiver": receiver,
-                    "duration": duration
-                }
-            )
-
-    return result
-
-
-# ============================================================
-# BANK NORMALIZATION
-#
-# Actual bank.csv structure:
-#
-# timestamp,account,upi,amount,type
-#
-# Example:
-#
-# AC1001 + scammer@upi + DEBIT
-#
-# becomes:
-#
-# AC1001 -> scammer@upi
-#
-# CREDIT:
-#
-# scammer@upi -> AC2001
-#
-# TRANSFER:
-#
-# AC2001 -> mule@upi
-#
-# CREDIT:
-#
-# mule@upi -> AC3001
-# ============================================================
-
-def normalize_bank(records):
-
-    result = []
-
-    for record in records:
-
-        timestamp = record.get(
-            "timestamp"
-        )
-
-        account = record.get(
-            "account"
-        )
-
-        upi = record.get(
-            "upi"
-        )
-
-        amount = record.get(
-            "amount"
-        )
-
-        transaction_type = record.get(
-            "type"
-        )
-
-        if not account or not upi:
-            continue
-
-        account = str(
-            account
-        ).strip()
-
-        upi = str(
-            upi
-        ).strip()
-
-        transaction_type = str(
-            transaction_type
-        ).strip().upper()
-
-        try:
-
-            amount = float(amount)
-
-            if amount.is_integer():
-                amount = int(amount)
-
-        except:
-
-            amount = None
-
-
-        # ----------------------------------------------------
-        # DEBIT
-        #
-        # Bank account sends money to UPI
-        #
-        # AC1001 -> scammer@upi
-        # ----------------------------------------------------
-
-        if transaction_type == "DEBIT":
-
-            source = account
-            target = upi
-            relationship = "DEBIT"
-
-
-        # ----------------------------------------------------
-        # CREDIT
-        #
-        # UPI sends money to bank account
-        #
-        # scammer@upi -> AC2001
-        #
-        # mule@upi -> AC3001
-        # ----------------------------------------------------
-
-        elif transaction_type == "CREDIT":
-
-            source = upi
-            target = account
-            relationship = "CREDIT"
-
-
-        # ----------------------------------------------------
-        # TRANSFER
-        #
-        # Bank account transfers money to UPI
-        #
-        # AC2001 -> mule@upi
-        # ----------------------------------------------------
-
-        elif transaction_type == "TRANSFER":
-
-            source = account
-            target = upi
-            relationship = "TRANSFER"
-
-
-        else:
-
-            source = account
-            target = upi
-            relationship = transaction_type
-
-
-        result.append(
-            {
-                "source": source,
-                "target": target,
-                "relationship": relationship,
-                "amount": amount,
-                "timestamp": str(timestamp)
-            }
-        )
-
-    return result
-
-
-# ============================================================
-# CHAT
-# ============================================================
-
-def load_chat():
-
-    if not os.path.exists(CHAT_PATH):
-        return ""
-
-    try:
-
-        with open(
-            CHAT_PATH,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            return file.read()
-
-    except Exception as error:
-
-        print(
-            "CHAT FILE ERROR:",
-            error
-        )
-
-        return ""
-
-
-# ============================================================
-# EXTRACT UPI IDS FROM CHAT
-# ============================================================
-
-def extract_chat_upis(text):
-
-    if not text:
-        return []
-
-    pattern = (
-        r"\b[a-zA-Z0-9._-]+"
-        r"@[a-zA-Z0-9._-]+\b"
-    )
-
-    matches = re.findall(
-        pattern,
-        text
-    )
-
-    result = []
-
-    for value in matches:
-
-        value = value.strip()
-
-        if value not in result:
-            result.append(value)
-
-    return result
-
-
-# ============================================================
-# GRAPH BUILDER
-# ============================================================
-
-def build_graph(
-    cdr_records,
-    bank_records,
-    entities
+@app.get("/cases")
+def get_cases():
+    """List all available investigation cases."""
+    return {
+        "cases": case_manager.list_cases()
+    }
+
+
+@app.post("/cases/upload")
+async def upload_case(
+    case_id: str = Form(...),
+    title: str = Form(""),
+    description: str = Form(""),
+    cdr_file: Optional[UploadFile] = File(None),
+    bank_file: Optional[UploadFile] = File(None),
+    chat_file: Optional[UploadFile] = File(None)
 ):
+    """
+    Create a new case by uploading CDR, Bank, and Chat evidence files.
+    """
+    case_id_clean = case_id.strip().replace(" ", "_").upper()
+    if not case_id_clean:
+        raise HTTPException(status_code=400, detail="Invalid Case ID")
 
-    nodes = {}
+    cdr_bytes = await cdr_file.read() if cdr_file else None
+    bank_bytes = await bank_file.read() if bank_file else None
+    chat_bytes = await chat_file.read() if chat_file else None
 
-    edges = []
+    if not cdr_bytes and not bank_bytes and not chat_bytes:
+        raise HTTPException(status_code=400, detail="At least one evidence file (CDR, Bank, or Chat) must be uploaded.")
 
-
-    # ========================================================
-    # PHONE NODES
-    # ========================================================
-
-    for phone in entities.get(
-        "phones",
-        []
-    ):
-
-        phone = normalize_phone(
-            phone
-        )
-
-        if phone:
-
-            nodes[phone] = {
-                "id": phone,
-                "type": "phone"
-            }
-
-
-    # ========================================================
-    # UPI NODES
-    # ========================================================
-
-    for upi in entities.get(
-        "upi_ids",
-        []
-    ):
-
-        upi = str(
-            upi
-        ).strip()
-
-        if upi:
-
-            nodes[upi] = {
-                "id": upi,
-                "type": "upi"
-            }
-
-
-    # ========================================================
-    # BANK ACCOUNT NODES
-    # ========================================================
-
-    for account in entities.get(
-        "bank_accounts",
-        []
-    ):
-
-        account = str(
-            account
-        ).strip()
-
-        if account:
-
-            nodes[account] = {
-                "id": account,
-                "type": "bank_account"
-            }
-
-
-    # ========================================================
-    # CDR RELATIONSHIPS
-    # ========================================================
-
-    for record in cdr_records:
-
-        source = record["caller"]
-
-        target = record["receiver"]
-
-        edges.append(
-            {
-                "source": source,
-                "target": target,
-                "relationship": "CALL",
-                "amount": None,
-                "timestamp": record["timestamp"]
-            }
-        )
-
-
-    # ========================================================
-    # BANK RELATIONSHIPS
-    # ========================================================
-
-    for record in bank_records:
-
-        edges.append(
-            {
-                "source": record["source"],
-                "target": record["target"],
-                "relationship": record["relationship"],
-                "amount": record["amount"],
-                "timestamp": record["timestamp"]
-            }
-        )
-
-
-    # ========================================================
-    # CHAT RELATIONSHIPS
-    #
-    # For the prototype we connect the first two relevant
-    # phones with the two UPI identities found in chat.
-    #
-    # This gives:
-    #
-    # 4 CALL
-    # 4 BANK
-    # 2 CHAT
-    #
-    # TOTAL = 10 relationships
-    # ========================================================
-
-    phones = entities.get(
-        "phones",
-        []
+    created = case_manager.create_case(
+        case_id=case_id_clean,
+        title=title or f"Investigation {case_id_clean}",
+        description=description or "Custom uploaded investigation dossier",
+        cdr_bytes=cdr_bytes,
+        bank_bytes=bank_bytes,
+        chat_bytes=chat_bytes
     )
 
-    upis = entities.get(
-        "upi_ids",
-        []
-    )
+    # Immediately run analysis to verify case integrity
+    analysis = analyze_case_data(created)
+    return {
+        "message": f"Case {case_id_clean} uploaded and analyzed successfully",
+        "case": created,
+        "analysis": analysis
+    }
 
 
-    if len(phones) >= 1 and len(upis) >= 1:
-
-        edges.append(
-            {
-                "source": phones[0],
-                "target": upis[0],
-                "relationship": "CHAT_LINK",
-                "amount": None,
-                "timestamp": None
-            }
-        )
-
-
-    if len(phones) >= 2 and len(upis) >= 2:
-
-        edges.append(
-            {
-                "source": phones[1],
-                "target": upis[1],
-                "relationship": "CHAT_LINK",
-                "amount": None,
-                "timestamp": None
-            }
-        )
+@app.delete("/cases/{case_id}")
+def delete_case(case_id: str):
+    """Delete a custom case."""
+    if case_id == "CYBER-2026-001":
+        raise HTTPException(status_code=400, detail="Default demonstration case cannot be deleted.")
+    success = case_manager.delete_case(case_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found.")
+    return {
+        "message": f"Case {case_id} deleted successfully"
+    }
 
 
-    return (
-        list(nodes.values()),
-        edges
-    )
+@app.get("/cases/{case_id}/analyze")
+def analyze_case(case_id: str):
+    """Run full correlation and forensic analysis on a specific case."""
+    case_info = case_manager.get_case(case_id)
+    if not case_info:
+        raise HTTPException(status_code=404, detail=f"Case '{case_id}' not found.")
+    return analyze_case_data(case_info)
 
-
-# ============================================================
-# RAPID TRANSFER DETECTION
-# ============================================================
-
-def detect_rapid_transfer(
-    bank_records
-):
-
-    if len(bank_records) < 2:
-        return False
-
-    timestamps = []
-
-    for record in bank_records:
-
-        timestamp = record.get(
-            "timestamp"
-        )
-
-        if timestamp:
-            timestamps.append(
-                str(timestamp)
-            )
-
-
-    # The supplied evidence contains multiple
-    # transactions occurring within minutes.
-
-    return len(timestamps) >= 2
-
-
-# ============================================================
-# ANALYZE
-# ============================================================
 
 @app.get("/analyze")
-def analyze():
-
-    # ========================================================
-    # CDR
-    # ========================================================
-
-    try:
-
-        raw_cdr = parse_cdr(
-            CDR_PATH
-        )
-
-        cdr_records = normalize_cdr(
-            raw_cdr
-        )
-
-    except Exception as error:
-
-        print(
-            "CDR ERROR:",
-            error
-        )
-
-        cdr_records = []
-
-
-    # ========================================================
-    # BANK
-    # ========================================================
-
-    try:
-
-        raw_bank = parse_bank(
-            BANK_PATH
-        )
-
-        print(
-            "RAW BANK RECORDS:",
-            raw_bank
-        )
-
-        bank_records = normalize_bank(
-            raw_bank
-        )
-
-        print(
-            "NORMALIZED BANK RECORDS:",
-            bank_records
-        )
-
-    except Exception as error:
-
-        print(
-            "BANK ERROR:",
-            error
-        )
-
-        bank_records = []
-
-
-    # ========================================================
-    # CHAT
-    # ========================================================
-
-    chat_text = load_chat()
-
-    try:
-
-        parse_chat(
-            CHAT_PATH
-        )
-
-    except Exception as error:
-
-        print(
-            "CHAT PARSER:",
-            error
-        )
-
-
-    # ========================================================
-    # ENTITY EXTRACTION
-    # ========================================================
-
-    combined_text = (
-        str(cdr_records)
-        + "\n"
-        + str(bank_records)
-        + "\n"
-        + chat_text
-    )
-
-
-    try:
-
-        entities = extract_entities(
-            combined_text
-        )
-
-    except Exception as error:
-
-        print(
-            "ENTITY EXTRACTION ERROR:",
-            error
-        )
-
-        entities = {
-            "phones": [],
-            "upi_ids": [],
-            "bank_accounts": [],
-            "ip_addresses": []
-        }
-
-
-    # ========================================================
-    # ADD PHONES FROM CDR
-    # ========================================================
-
-    for record in cdr_records:
-
-        caller = record["caller"]
-
-        receiver = record["receiver"]
-
-
-        if caller not in entities["phones"]:
-
-            entities["phones"].append(
-                caller
-            )
-
-
-        if receiver not in entities["phones"]:
-
-            entities["phones"].append(
-                receiver
-            )
-
-
-    # ========================================================
-    # ADD BANK ACCOUNTS + UPI IDS
-    # ========================================================
-
-    for record in bank_records:
-
-        source = record["source"]
-
-        target = record["target"]
-
-
-        # Source
-
-        if "@" in source:
-
-            if source not in entities["upi_ids"]:
-
-                entities["upi_ids"].append(
-                    source
-                )
-
-        else:
-
-            if source not in entities["bank_accounts"]:
-
-                entities["bank_accounts"].append(
-                    source
-                )
-
-
-        # Target
-
-        if "@" in target:
-
-            if target not in entities["upi_ids"]:
-
-                entities["upi_ids"].append(
-                    target
-                )
-
-        else:
-
-            if target not in entities["bank_accounts"]:
-
-                entities["bank_accounts"].append(
-                    target
-                )
-
-
-    # ========================================================
-    # ADD CHAT UPI IDS
-    # ========================================================
-
-    chat_upis = extract_chat_upis(
-        chat_text
-    )
-
-
-    for upi in chat_upis:
-
-        if upi not in entities["upi_ids"]:
-
-            entities["upi_ids"].append(
-                upi
-            )
-
-
-    # ========================================================
-    # BUILD GRAPH
-    # ========================================================
-
-    node_data, edge_data = build_graph(
-        cdr_records,
-        bank_records,
-        entities
-    )
-
-
-    # ========================================================
-    # RAPID TRANSFER
-    # ========================================================
-
-    rapid_transfer = detect_rapid_transfer(
-        bank_records
-    )
-
-
-    # ========================================================
-    # RISK SCORE
-    #
-    # 4 transactions  = +20
-    # 9 entities      = +25
-    # rapid transfer  = +30
-    #
-    # TOTAL            = 75
-    # LEVEL            = HIGH
-    # ========================================================
-
-    risk_analysis = calculate_risk(
-
-        transaction_count=len(
-            bank_records
-        ),
-
-        connected_entities=len(
-            node_data
-        ),
-
-        rapid_transfer=rapid_transfer
-    )
-
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
-
-    return {
-
-        "case_id":
-            "CYBER-2026-001",
-
-        "evidence": {
-
-            "cdr_records":
-                len(cdr_records),
-
-            "bank_records":
-                len(bank_records),
-
-            "chat_evidence":
-                bool(
-                    chat_text.strip()
-                )
-
-        },
-
-        "entities": {
-
-            "phones":
-                entities.get(
-                    "phones",
-                    []
-                ),
-
-            "upi_ids":
-                entities.get(
-                    "upi_ids",
-                    []
-                ),
-
-            "bank_accounts":
-                entities.get(
-                    "bank_accounts",
-                    []
-                ),
-
-            "ip_addresses":
-                entities.get(
-                    "ip_addresses",
-                    []
-                )
-
-        },
-
-        "graph": {
-
-            "nodes":
-                len(node_data),
-
-            "relationships":
-                len(edge_data),
-
-            "node_data":
-                node_data,
-
-            "edge_data":
-                edge_data
-
-        },
-
-        "risk_analysis":
-            risk_analysis
-    }
+def analyze_default():
+    """Default compatibility endpoint analyzing case CYBER-2026-001."""
+    case_info = case_manager.get_case("CYBER-2026-001")
+    if not case_info:
+        raise HTTPException(status_code=404, detail="Default case not found.")
+    return analyze_case_data(case_info)
 
 
 # ============================================================
@@ -899,9 +418,7 @@ def analyze():
 # ============================================================
 
 if __name__ == "__main__":
-
     import uvicorn
-
     uvicorn.run(
         "main:app",
         host="127.0.0.1",
